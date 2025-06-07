@@ -1,54 +1,113 @@
-# svgterm
+# SVG Terminal Recorder
 
-<a href="https://github.com/khulnasoft-lab/svgterm/actions/workflows/test.yml" target="_blank">
-    <img src="https://github.com/khulnasoft-lab/svgterm/actions/workflows/test.yml/badge.svg" alt="Test">
-</a>
-<a href="https://github.com/khulnasoft-lab/svgterm/actions/workflows/publish.yml" target="_blank">
-    <img src="https://github.com/khulnasoft-lab/svgterm/actions/workflows/publish.yml/badge.svg" alt="Publish">
-</a>
-<a href="https://coverage-badge.samuelcolvin.workers.dev/redirect/khulnasoft-lab/svgterm" target="_blank">
-    <img src="https://coverage-badge.samuelcolvin.workers.dev/khulnasoft-lab/svgterm.svg" alt="Coverage">
-<a href="https://pypi.org/project/svgterm" target="_blank">
-    <img src="https://img.shields.io/pypi/v/svgterm?color=%2334D058&label=pypi%20package" alt="Package version">
-</a>
+[![Tests](https://github.com/khulnasoft-lab/svgterm/actions/workflows/test.yml/badge.svg)](https://github.com/khulnasoft-lab/svgterm/actions/workflows/test.yml)
+[![PyPI Version](https://img.shields.io/pypi/v/svgterm?color=%2334D058)](https://pypi.org/project/svgterm/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/svgterm.svg)](https://pypi.org/project/svgterm/)
+[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![License](https://img.shields.io/pypi/l/svgterm.svg)](https://opensource.org/licenses/BSD-3-Clause)
 
----
+A modern terminal recorder that renders your command line sessions as standalone SVG animations or still frames.
 
-svgterm is a Unix terminal recorder written in Python that renders your command
-line sessions as standalone SVG animations.
+## ✨ Features
 
-* [Gallery of examples](https://khulnasoft-lab.github.io/svgterm/pages/examples.html)
-* [Gallery of templates](https://khulnasoft-lab.github.io/svgterm/pages/templates.html)
+- 🎥 Record terminal sessions or render existing recordings
+- 🖼️ Generate lightweight, embeddable SVG animations or still frames
+- 🎨 Customize appearance with themes and templates
+- 🚀 Fast rendering with modern Python (3.7+)
+- 📦 Easy installation via pip
+- 🧩 Extensible architecture with a clean API
 
-## Features
-* Produce lightweight and clean looking animations or still frames embeddable on a project page
-* Custom color themes, terminal UI and animation controls via user-defined [SVG templates](man/svgterm-templates.md)
-* Rendering of recordings in asciicast format made with asciinema
+## 📦 Installation
 
-## Installation
-svgterm is compatible with Linux, macOS and BSD OSes, requires Python >= 3.5 and can be installed as follows using pip:
-```shell
-# Create virtualenv named '.venv'
-python3 -m venv .venv
-# Activate virtualenv
-source .venv/bin/activate
-pip3 install svgterm
+```bash
+# Requires Python 3.7+
+pip install svgterm
 ```
-Then run svgterm by calling either `svgterm` or `python3 -m svgterm`.
 
-Various independently maintained, OS specific packages have been made available by the community:
+### Development Installation
 
-| OS       | Repository  | Installation command  |
-|----------|-------------|---|
-| Archlinux  | [Arch](https://www.archlinux.org/packages/community/any/svgterm/)  |`pacman -S svgterm`   |
-| FreeBSD | [ports](https://www.freshports.org/graphics/py-svgterm) | |
-| Gentoo | [media-gfx/svgterm](https://packages.gentoo.org/packages/media-gfx/svgterm) | `emerge media-gfx/svgterm`|
-| macOS  | [Homebrew](https://formulae.brew.sh/formula/svgterm)  |`brew install svgterm`   |
-| OpenBSD  | [ports](https://github.com/openbsd/ports/tree/master/graphics/svgterm)  |   |
-| NixOS | [nixpkgs](https://github.com/NixOS/nixpkgs/blob/master/pkgs/tools/misc/svgterm/) | |
+```bash
+# Clone the repository
+git clone https://github.com/khulnasoft-lab/svgterm.git
+cd svgterm
 
+# Install in development mode with all dependencies
+pip install -e '.[dev]'
 
-## Basic usage
+# Run tests
+pytest
+```
+
+### System Packages
+
+| OS | Installation |
+|----|-------------|
+| **macOS** | `brew install svgterm` |
+| **Arch Linux** | `pacman -S svgterm` |
+| **NixOS** | `nix-env -iA nixos.svgterm` |
+| **FreeBSD** | `pkg install py39-svgterm` |
+
+## 🚀 Basic Usage
+
+### Record and render a terminal session
+
+```bash
+# Record a terminal session and save as animation.svg
+svgterm -o animation.svg
+
+# Record a specific command
+svgterm -c 'ls -la' -o listing.svg
+
+# Generate still frames instead of animation
+svgterm -s -o frame.svg
+```
+
+### Render an existing recording
+
+```bash
+# Render an asciicast recording
+svgterm render recording.cast -o animation.svg
+```
+
+### Advanced Options
+
+```bash
+# Set terminal size (columns x rows)
+svgterm -g 80x24 -o output.svg
+
+# Set minimum/maximum frame duration (ms)
+svgterm -m 50 -M 1000 -o output.svg
+
+# Use a custom template
+svgterm -t my_template -o output.svg
+```
+
+## 🎨 Customization
+
+### Templates
+
+Create custom SVG templates in `~/.config/svgterm/templates/`. See the [templates documentation](docs/templates.md) for details.
+
+### Themes
+
+Customize colors and styling with themes. Place theme files in `~/.config/svgterm/themes/`.
+
+## 📚 Documentation
+
+For more detailed documentation, see:
+
+- [Command Line Reference](docs/cli.md)
+- [API Documentation](docs/api.md)
+- [Creating Templates](docs/templates.md)
+- [Examples](docs/examples.md)
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read our [contributing guidelines](CONTRIBUTING.md) to get started.
+
+## 📄 License
+
+This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.
 Start recording with:
 
 ```

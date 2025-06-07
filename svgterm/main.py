@@ -1,4 +1,11 @@
-"""Command line interface of svgterm"""
+"""Command line interface for SVG Terminal Recorder.
+
+This module provides the main command-line interface for recording terminal sessions
+and rendering them as SVG animations or still frames. It handles argument parsing,
+subcommand dispatching, and orchestrates the recording and rendering processes.
+"""
+
+from __future__ import annotations
 
 import argparse
 import logging
@@ -6,235 +13,566 @@ import os
 import shlex
 import sys
 import tempfile
-import pkg_resources
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+    IO,
+    Generator,
+    BinaryIO,
+    TextIO,
+    AnyStr,
+    Callable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    NamedTuple,
+    NoReturn,
+    Type,
+    TypeVar,
+    overload,
+)
 
-import svgterm.config
+from typing_extensions import TypedDict, Literal, Protocol
+
+from svgterm import __version__
 import svgterm.anim
+import svgterm.config
+import svgterm.term
+from svgterm.types import (
+    Milliseconds,
+    Geometry,
+    TemplateName,
+    Template,
+    AnimationConfig,
+)
 
-logger = logging.getLogger("svgterm")
+# Type variables
+T = TypeVar('T')
+KT = TypeVar('KT')
+VT = TypeVar('VT')
 
-DEFAULT_LOOP_DELAY = 1000
+# Constants
+DEFAULT_LOOP_DELAY: Milliseconds = 1000
+DEFAULT_MIN_FRAME_DURATION: Milliseconds = 1
+DEFAULT_GEOMETRY: Geometry = (80, 24)
+DEFAULT_TEMPLATE: str = "powershell"
 
-USAGE = """svgterm [output_path] [-c COMMAND] [-D DELAY] [-g GEOMETRY]
-                 [-m MIN_DURATION] [-M MAX_DURATION] [-s] [-t TEMPLATE] [-h]
+# Module-level logger
+logger: logging.Logger = logging.getLogger(__name__)
 
-Record a terminal session and render an SVG animation on the fly
+# Usage strings for help messages
+USAGE = """
+svgterm [output_path] [-c COMMAND] [-D DELAY] [-g GEOMETRY]
+        [-m MIN_DURATION] [-M MAX_DURATION] [-s] [-t TEMPLATE] [-h]
+
+Record a terminal session and render an SVG animation on the fly.
 """
-EPILOG = "See also 'svgterm record --help' and 'svgterm render --help'"
-RECORD_USAGE = "svgterm record [output_path] [-c COMMAND] [-g GEOMETRY] [-h]"
-RENDER_USAGE = """svgterm render input_file [output_path] [-D DELAY]
-                 [-m MIN_DURATION] [-M MAX_DURATION] [-s] [-t TEMPLATE] [-h]"""
+
+EPILOG = """
+See also:
+  svgterm record --help    For recording terminal sessions
+  svgterm render --help   For rendering recorded sessions
+"""
+
+RECORD_USAGE = """
+svgterm record [output_path] [-c COMMAND] [-g GEOMETRY] [-h]
+
+Record a terminal session to an asciicast file.
+"""
+
+RENDER_USAGE = """
+svgterm render input_file [output_path] [-D DELAY] [-m MIN_DURATION]
+        [-M MAX_DURATION] [-s] [-t TEMPLATE] [-h]
+
+Render a recorded terminal session as an SVG animation or still frames.
+"""
 
 
-def integral_duration_validation(duration):
-    if duration.lower().endswith("ms"):
-        duration = duration[: -len("ms")]
-
-    if duration.isdigit() and int(duration) >= 1:
-        return int(duration)
-    raise ValueError("duration must be an integer greater than 0")
-
-
-def parse(
-    args,
-    templates,
-    default_template,
-    default_geometry,
-    default_min_dur,
-    default_max_dur,
-    default_cmd,
-    default_loop_delay,
-):
-    """Parse command line arguments
-
-    :param args: Arguments to parse
-    :param templates: Mapping between template names and templates
-    :param default_template: Name of the default template
-    :param default_geometry: Default geometry of the screen
-    :param default_min_dur: Default minimal duration between frames in
-    milliseconds
-    :param default_max_dur: Default maximal duration between frames in
-    milliseconds
-    :param default_max_dur: Default maximal duration between frames in
-    milliseconds
-    :param default_cmd: Default program (with argument list) recorded
-    :param default_loop_delay: Duration of the pause between two consecutive
-    loops of the animation in milliseconds
-    :return: Tuple made of the subcommand called (None, 'render' or 'record')
-    and all parsed
-    arguments
+class CommandLineArgs(TypedDict, total=False):
+    """Typed dictionary for parsed command line arguments.
+    
+    This class defines the structure of the parsed command line arguments
+    with proper type hints. The 'total=False' indicates that all fields are optional.
     """
+    command: str
+    output_path: Optional[str]
+    input_file: Optional[str]
+    screen_geometry: Optional[Geometry]
+    min_frame_duration: Milliseconds
+    max_frame_duration: Optional[Milliseconds]
+    loop_delay: Milliseconds
+    template: Union[TemplateName, Template]
+    still_frames: bool
+    verbose: bool
+    quiet: bool
+    env: Optional[Dict[str, str]]
+
+
+def validate_geometry(geometry_str: str) -> Geometry:
+    """Validate and parse a geometry string.
+    
+    Args:
+        geometry_str: String in format 'WIDTHxHEIGHT'
+        
+    Returns:
+        Tuple of (width, height) as integers
+        
+    Raises:
+        argparse.ArgumentTypeError: If the geometry string is invalid
+    """
+    try:
+        if not geometry_str:
+            raise ValueError("Empty geometry string")
+            
+        parts = geometry_str.lower().split('x')
+        if len(parts) != 2:
+            raise ValueError("Geometry must be in format WIDTHxHEIGHT")
+            
+        width, height = map(int, parts)
+        if width <= 0 or height <= 0:
+            raise ValueError("Width and height must be positive integers")
+            
+        return width, height
+        
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"Invalid geometry: {geometry_str}. {str(e)}"
+        )
+
+
+def validate_duration(duration_str: str) -> Milliseconds:
+    """Validate and convert a duration string to milliseconds.
+    
+    Args:
+        duration_str: Duration string (e.g., '100ms' or '1.5s')
+        
+    Returns:
+        Duration in milliseconds
+        
+    Raises:
+        argparse.ArgumentTypeError: If the duration is invalid
+    """
+    try:
+        if not duration_str:
+            raise ValueError("Empty duration string")
+            
+        # Remove 'ms' suffix if present
+        if duration_str.lower().endswith('ms'):
+            value = float(duration_str[:-2])
+        # Remove 's' suffix if present
+        elif duration_str[-1].lower() == 's':
+            value = float(duration_str[:-1]) * 1000
+        else:
+            value = float(duration_str)
+            
+        if value <= 0:
+            raise ValueError("Duration must be positive")
+            
+        return int(round(value))
+        
+    except (ValueError, TypeError) as e:
+        raise argparse.ArgumentTypeError(
+            f"Invalid duration: {duration_str}. {str(e)}"
+        )
+
+
+def integral_duration_validation(duration: str) -> int:
+    """Validate and convert a duration string to milliseconds.
+    
+    This is a backward-compatible wrapper around the newer validate_duration function,
+    maintained for compatibility with existing code.
+    
+    Args:
+        duration: Duration string, optionally ending with 'ms' or 's'
+        
+    Returns:
+        Duration in milliseconds as an integer
+        
+    Raises:
+        ValueError: If duration is not a positive number
+    """
+    try:
+        return validate_duration(duration)
+    except argparse.ArgumentTypeError as e:
+        # Convert to ValueError for backward compatibility
+        raise ValueError(str(e)) from e
+
+
+def create_geometry_parser(parser: argparse.ArgumentParser) -> None:
+    """Add geometry-related arguments to a parser.
+    
+    Args:
+        parser: Argument parser to add geometry arguments to
+    """
+    geometry_group = parser.add_argument_group('geometry arguments')
+    
+    # Add --screen-geometry as the primary option
+    geometry_group.add_argument(
+        '--screen-geometry',
+        dest='screen_geometry',
+        type=validate_geometry,
+        help='Terminal dimensions in the form "WIDTHxHEIGHT". Default: terminal size',
+        metavar='GEOMETRY'
+    )
+    
+    # Add --geometry and -g as aliases for backward compatibility
+    if not any(any(opt in action.option_strings for opt in ['--geometry', '-g'])
+              for action in parser._actions 
+              if hasattr(action, 'option_strings')):
+        geometry_group.add_argument(
+            '--geometry', '-g',
+            dest='screen_geometry',
+            type=validate_geometry,
+            help=argparse.SUPPRESS,  # Hidden from help as it's deprecated
+            metavar='GEOMETRY'
+        )
+
+
+def create_common_parsers(
+    templates: Dict[str, str],
+    default_template: str,
+    default_min_dur: int,
+    default_max_dur: Optional[int],
+    default_loop_delay: int,
+) -> Dict[str, argparse.ArgumentParser]:
+    """Create common argument parsers.
+    
+    Args:
+        templates: Available template names and content
+        default_template: Default template name
+        default_min_dur: Default minimum frame duration
+        default_max_dur: Default maximum frame duration
+        default_loop_delay: Default loop delay
+        
+    Returns:
+        Dictionary of common argument parsers
+    """
+    # Parser for common arguments
+    common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose output'
+    )
+    common_parser.add_argument(
+        '-q', '--quiet',
+        action='store_true',
+        help='Suppress non-error output'
+    )
+    
+    # Parser for command specification
     command_parser = argparse.ArgumentParser(add_help=False)
-
-    # https://stackoverflow.com/questions/15405636/pythons-argparse-to-show-programs-version-with-prog-and-version-string-formatt
-    # https://stackoverflow.com/questions/2058802/how-can-i-get-the-version-defined-in-setup-py-setuptools-in-my-package
     command_parser.add_argument(
-        "-v",
-        "--version",
-        action="version",
-        version="%(prog)s {}".format(pkg_resources.require("svgterm")[0].version),
+        '-c', '--command',
+        default=os.environ.get('SHELL', 'sh'),
+        help='Command to execute in the terminal (default: $SHELL or sh)'
     )
-
-    command_parser.add_argument(
-        "-c",
-        "--command",
-        help=(
-            (
-                "specify the program to record with optional arguments " "(default: {})"
-            ).format(default_cmd)
-        ),
-        default=default_cmd,
-        metavar="COMMAND",
-    )
-
-    still_frames_parser = argparse.ArgumentParser(add_help=False)
-    still_frames_parser.add_argument(
-        "-s",
-        "--still-frames",
-        help="output still frames instead of an animation. ",
-        action="store_true",
-    )
-
+    
+    # Parser for template selection
     template_parser = argparse.ArgumentParser(add_help=False)
     template_parser.add_argument(
-        "-t",
-        "--template",
-        help=(
-            "set the SVG template used for rendering the SVG animation. "
-            "TEMPLATE may either be one of the default templates ({}) "
-            "or a path to a valid template."
-        ).format(", ".join(templates)),
-        type=lambda name: svgterm.anim.validate_template(name, templates),
+        '-t', '--template',
+        choices=list(templates.keys()),
         default=default_template,
-        metavar="TEMPLATE",
+        help='SVG template to use (default: %(default)s)'
     )
-    geometry_parser = argparse.ArgumentParser(add_help=False)
-    geometry_parser.add_argument(
-        "-g",
-        "--screen-geometry",
-        help="geometry of the terminal screen used for rendering the animation."
-        " The geometry must be given as the number of columns and the "
-        'number of rows on the screen separated by the character "x". '
-        'For example "82x19" for an 82 columns by 19 rows screen.',
-        metavar="GEOMETRY",
-        default=default_geometry,
-        type=svgterm.config.validate_geometry,
-    )
-    min_duration_parser = argparse.ArgumentParser(add_help=False)
-    min_duration_parser.add_argument(
-        "-m",
-        "--min-frame-duration",
+    
+    # Parser for duration-related arguments
+    duration_parser = argparse.ArgumentParser(add_help=False)
+    duration_parser.add_argument(
+        '-m', '--min-frame-duration',
         type=integral_duration_validation,
-        metavar="MIN_DURATION",
         default=default_min_dur,
-        help=(
-            "minimum duration of a frame in milliseconds (default: {}ms)".format(
-                default_min_dur
-            )
-        ),
+        help=f'Minimum frame duration in ms (default: {default_min_dur}ms)'
     )
-
-    if default_max_dur:
-        default_max_dur_label = "{}ms".format(default_max_dur)
+    
+    if default_max_dur is not None:
+        max_dur_help = f'Maximum frame duration in ms (default: {default_max_dur}ms)'
     else:
-        default_max_dur_label = "No maximum value"
-
-    max_duration_parser = argparse.ArgumentParser(add_help=False)
-    max_duration_parser.add_argument(
-        "-M",
-        "--max-frame-duration",
+        max_dur_help = 'Maximum frame duration in ms (default: no limit)'
+    
+    duration_parser.add_argument(
+        '-M', '--max-frame-duration',
         type=integral_duration_validation,
-        metavar="MAX_DURATION",
         default=default_max_dur,
-        help=(
-            "maximum duration of a frame in milliseconds (default: {})".format(
-                default_max_dur_label
-            )
-        ),
+        help=max_dur_help
     )
-
-    loop_delay_parser = argparse.ArgumentParser(add_help=False)
-    loop_delay_parser.add_argument(
-        "-D",
-        "--loop-delay",
+    
+    duration_parser.add_argument(
+        '-D', '--loop-delay',
         type=integral_duration_validation,
-        metavar="DELAY",
         default=default_loop_delay,
-        help=(
-            (
-                "duration in milliseconds of the pause between two consecutive "
-                "loops of the animation (default: {}ms)"
-            ).format(default_loop_delay)
-        ),
+        help=f'Delay between animation loops in ms (default: {default_loop_delay}ms)'
     )
+    
+    # Parser for still frames option
+    still_parser = argparse.ArgumentParser(add_help=False)
+    still_parser.add_argument(
+        '-s', '--still-frames',
+        action='store_true',
+        help='Generate still frames instead of an animation'
+    )
+    
+    return {
+        'common': common_parser,
+        'command': command_parser,
+        'template': template_parser,
+        'duration': duration_parser,
+        'still': still_parser,
+    }
 
+
+def parse_geometry(geometry_str: Optional[str]) -> Optional[Geometry]:
+    """Parse a geometry string into a (width, height) tuple.
+    
+    Args:
+        geometry_str: String in format 'WIDTHxHEIGHT' or None
+        
+    Returns:
+        Tuple of (width, height) as integers, or None if input is invalid
+    """
+    if not geometry_str:
+        return None
+    try:
+        width, height = map(int, geometry_str.lower().split('x'))
+        if width <= 0 or height <= 0:
+            raise ValueError("Width and height must be positive")
+        return width, height
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError(
+            f'Invalid geometry: {geometry_str}. Expected format: WIDTHxHEIGHT'
+        )
+
+def parse(
+    args: List[str],
+    templates: Dict[str, str],
+    default_template: str,
+    default_geometry: Optional[Geometry],
+    default_min_dur: int,
+    default_max_dur: Optional[int],
+    default_cmd: str,
+    default_loop_delay: int,
+) -> Tuple[Optional[str], CommandLineArgs]:
+    """Parse command line arguments.
+
+    Args:
+        args: Command line arguments to parse
+        templates: Mapping between template names and template content
+        default_template: Name of the default template to use
+        default_geometry: Default terminal geometry as (columns, rows)
+        default_min_dur: Default minimum frame duration in milliseconds
+        default_max_dur: Default maximum frame duration in milliseconds
+        default_cmd: Default command to run in the terminal
+        default_loop_delay: Default delay between animation loops in milliseconds
+
+    Returns:
+        A tuple containing:
+            - The subcommand (None, 'record', or 'render')
+            - A dictionary of parsed arguments
+    """
+    # Create the main parser
     parser = argparse.ArgumentParser(
         prog="svgterm",
-        parents=[
-            command_parser,
-            loop_delay_parser,
-            geometry_parser,
-            min_duration_parser,
-            max_duration_parser,
-            still_frames_parser,
-            template_parser,
-        ],
+        description="Record and render terminal sessions as SVG animations",
         usage=USAGE,
         epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False
+    )
+    
+    # Add common arguments
+    parser.add_argument(
+        '-h', '--help',
+        action='help',
+        default=argparse.SUPPRESS,
+        help='show this help message and exit'
     )
     parser.add_argument(
-        "output_path",
-        nargs="?",
-        help="optional filename of the SVG animation. If --still-frame is "
-        "specified, output_path should be the path of the directory where "
-        "still frames will be stored. If missing, a random path "
-        "will be automatically generated.",
-        metavar="output_path",
+        '-V', '--version',
+        action='version',
+        version=f'%(prog)s {__version__}'
     )
-    if args:
-        if args[0] == "record":
-            parser = argparse.ArgumentParser(
-                description="record the session to a file in asciicast v2 format",
-                parents=[command_parser, geometry_parser],
-                usage=RECORD_USAGE,
-            )
-            parser.add_argument(
-                "output_path",
-                nargs="?",
-                help="optional filename of the cast file. If missing, a random "
-                "path will be automatically generated.",
-                metavar="output_path",
-            )
-            return args[0], parser.parse_args(args[1:])
-
-        if args[0] == "render":
-            parser = argparse.ArgumentParser(
-                description="render an asciicast recording as an SVG animation",
-                parents=[
-                    loop_delay_parser,
-                    min_duration_parser,
-                    max_duration_parser,
-                    still_frames_parser,
-                    template_parser,
-                ],
-                usage=RENDER_USAGE,
-            )
-            parser.add_argument(
-                "input_file",
-                help="recording of a terminal session in asciicast v1 or v2 format",
-            )
-            parser.add_argument(
-                "output_path",
-                nargs="?",
-                help="optional filename of the SVG animation. If --still-frame "
-                "is specified, output_path should be the path of the "
-                "directory where still frames will be stored. If "
-                "missing, a random path will be automatically generated.",
-                metavar="output_path",
-            )
-            return args[0], parser.parse_args(args[1:])
-
-    return None, parser.parse_args(args)
+    
+    # Add subparsers for different commands
+    subparsers = parser.add_subparsers(
+        dest='subcommand',
+        help='Subcommand to execute',
+        metavar='{record,render}'
+    )
+    
+    # Helper function to add common arguments to a subparser
+    def add_common_arguments(subparser):
+        # Add template selection
+        subparser.add_argument(
+            '-t', '--template',
+            choices=list(templates.keys()),
+            default=default_template,
+            help='SVG template to use (default: %(default)s)'
+        )
+        # Add duration arguments
+        subparser.add_argument(
+            '-m', '--min-frame-duration',
+            type=integral_duration_validation,
+            default=default_min_dur,
+            help=f'Minimum frame duration in ms (default: {default_min_dur}ms)'
+        )
+        if default_max_dur is not None:
+            max_dur_help = f'Maximum frame duration in ms (default: {default_max_dur}ms)'
+        else:
+            max_dur_help = 'Maximum frame duration in ms (default: no limit)'
+        subparser.add_argument(
+            '-M', '--max-frame-duration',
+            type=integral_duration_validation,
+            default=default_max_dur,
+            help=max_dur_help
+        )
+        subparser.add_argument(
+            '-D', '--loop-delay',
+            type=integral_duration_validation,
+            default=default_loop_delay,
+            help=f'Delay between animation loops in ms (default: {default_loop_delay}ms)'
+        )
+        # Add verbosity flags
+        subparser.add_argument(
+            '-v', '--verbose',
+            action='store_true',
+            help='increase output verbosity'
+        )
+        subparser.add_argument(
+            '-q', '--quiet',
+            action='store_true',
+            help='decrease output verbosity'
+        )
+    
+    # Record subcommand
+    record_parser = subparsers.add_parser(
+        'record',
+        help='Record a terminal session to a file',
+        usage=RECORD_USAGE,
+        add_help=False
+    )
+    record_parser.add_argument(
+        'filename',
+        nargs='?',
+        help='filename of the recording (default: auto-generated name)'
+    )
+    record_parser.add_argument(
+        '-c', '--command',
+        default=default_cmd,
+        help='Command to execute in the terminal (default: %(default)s)'
+    )
+    record_parser.add_argument(
+        '-e', '--env',
+        default='SHELL,TERM',
+        help='list of environment variables to capture, defaults to "SHELL,TERM"'
+    )
+    add_common_arguments(record_parser)
+    create_geometry_parser(record_parser)
+    
+    # Render subcommand
+    render_parser = subparsers.add_parser(
+        'render',
+        help='Render an asciicast recording as an SVG animation',
+        usage=RENDER_USAGE,
+        add_help=False
+    )
+    render_parser.add_argument(
+        'input_file',
+        metavar='input_file',
+        help='recording of a terminal session in asciicast v1 or v2 format'
+    )
+    render_parser.add_argument(
+        'output_path',
+        nargs='?',
+        metavar='output_path',
+        help='filename of the SVG animation or directory for still frames. If --still-frame is '
+             'specified, output_path should be the path of the directory where still frames will be '
+             'stored. If missing, a random path will be automatically generated.'
+    )
+    render_parser.add_argument(
+        '-s', '--still-frames',
+        action='store_true',
+        help='Save each frame as an individual SVG file instead of an animation',
+    )
+    add_common_arguments(render_parser)
+    
+    # Default command (record and render in one step)
+    default_parser = subparsers.add_parser(
+        'default',
+        help='record and render in one command (default)',
+        usage=USAGE,
+        add_help=False
+    )
+    default_parser.add_argument(
+        'output_path',
+        nargs='?',
+        help='filename of the SVG animation or directory for still frames',
+        metavar='output_path'
+    )
+    default_parser.add_argument(
+        '-c', '--command',
+        default=default_cmd,
+        help='Command to execute in the terminal (default: %(default)s)'
+    )
+    default_parser.add_argument(
+        '-s', '--still-frames',
+        action='store_true',
+        help='render still frames instead of an animation'
+    )
+    add_common_arguments(default_parser)
+    create_geometry_parser(default_parser)
+    
+    # Handle default command if no subcommand is provided
+    if not args or args[0] not in ['record', 'render', 'default']:
+        args = ['default'] + (args or [])
+    
+    # Parse arguments
+    parsed_args = parser.parse_args(args)
+    
+    # Convert screen_geometry string to tuple if it exists
+    screen_geometry = default_geometry
+    if hasattr(parsed_args, 'screen_geometry') and parsed_args.screen_geometry:
+        if isinstance(parsed_args.screen_geometry, str):
+            try:
+                screen_geometry = parse_geometry(parsed_args.screen_geometry)
+            except argparse.ArgumentTypeError:
+                screen_geometry = default_geometry
+    
+    # Convert to CommandLineArgs dictionary
+    result_args: CommandLineArgs = {
+        'command': getattr(parsed_args, 'command', default_cmd),
+        'output_path': getattr(parsed_args, 'output_path', None),
+        'input_file': getattr(parsed_args, 'input_file', None),
+        'screen_geometry': screen_geometry,
+        'min_frame_duration': getattr(parsed_args, 'min_frame_duration', default_min_dur),
+        'max_frame_duration': getattr(parsed_args, 'max_frame_duration', default_max_dur),
+        'loop_delay': getattr(parsed_args, 'loop_delay', default_loop_delay),
+        'template': getattr(parsed_args, 'template', default_template),
+        'still_frames': getattr(parsed_args, 'still_frames', False),
+        'verbose': getattr(parsed_args, 'verbose', False),
+        'quiet': getattr(parsed_args, 'quiet', False),
+        'env': None
+    }
+    
+    # Special handling for record subcommand
+    if parsed_args.subcommand == 'record':
+        result_args['output_path'] = getattr(parsed_args, 'filename', None)
+        # Parse environment variables
+        if hasattr(parsed_args, 'env') and parsed_args.env:
+            result_args['env'] = {var.strip(): os.environ.get(var.strip(), '') 
+                                for var in parsed_args.env.split(',') if var.strip()}
+    
+    return (parsed_args.subcommand if parsed_args.subcommand != 'default' else None, 
+            result_args)
 
 
 def record_subcommand(
@@ -330,100 +668,121 @@ def record_render_subcommand(
     logger.info(end_msg.format(output_path))
 
 
-def main(args=None, input_fileno=None, output_fileno=None):
+def main(args=None, input_fileno=None, output_fileno=None) -> None:
+    """Main entry point for the svgterm command line interface.
+
+    Args:
+        args: Command line arguments (default: None, which uses sys.argv[1:])
+        input_fileno: File descriptor for input (default: None, which uses sys.stdin.fileno())
+        output_fileno: File descriptor for output (default: None, which uses sys.stdout.fileno())
+    """
     if args is None:
-        args = sys.argv
-    if input_fileno is None:
-        input_fileno = sys.stdin.fileno()
-    if output_fileno is None:
-        output_fileno = sys.stdout.fileno()
+        args = sys.argv[1:]
 
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(logging.INFO)
-    console_formatter = logging.Formatter("%(message)s")
-    console_handler.setFormatter(console_formatter)
-    logger.handlers = [console_handler]
-    logger.setLevel(logging.INFO)
-
-    templates = svgterm.config.default_templates()
-    default_template = "powershell"
-    default_cmd = os.environ.get("SHELL", "sh")
-    command, args = parse(
-        args[1:],
-        templates,
-        default_template,
-        None,
-        1,
-        None,
-        default_cmd,
-        DEFAULT_LOOP_DELAY,
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        stream=sys.stderr
     )
+    logger = logging.getLogger('svgterm')
 
-    if command == "record":
-        if args.output_path is None:
-            _, cast_filename = tempfile.mkstemp(prefix="svgterm_", suffix=".cast")
-        else:
-            cast_filename = args.output_path
-        process_args = shlex.split(args.command)
-        record_subcommand(
-            process_args,
-            args.screen_geometry,
-            input_fileno,
-            output_fileno,
-            cast_filename,
-        )
-    elif command == "render":
-        if args.output_path is None:
-            if args.still_frames:
-                output_path = tempfile.mkdtemp(prefix="svgterm_")
-            else:
-                _, output_path = tempfile.mkstemp(prefix="svgterm_", suffix=".svg")
-        else:
-            output_path = args.output_path
-            if args.still_frames:
-                try:
-                    os.mkdir(output_path)
-                except FileExistsError:
-                    if not os.path.isdir(output_path):
-                        raise
-
-        render_subcommand(
-            args.still_frames,
-            args.template,
-            args.input_file,
-            output_path,
-            args.min_frame_duration,
-            args.max_frame_duration,
-            args.loop_delay,
-        )
-    else:
-        if args.output_path is None:
-            if args.still_frames:
-                output_path = tempfile.mkdtemp(prefix="svgterm_")
-            else:
-                _, output_path = tempfile.mkstemp(prefix="svgterm_", suffix=".svg")
-        else:
-            output_path = args.output_path
-            if args.still_frames:
-                try:
-                    os.mkdir(output_path)
-                except FileExistsError:
-                    if not os.path.isdir(output_path):
-                        raise
-
-        process_args = shlex.split(args.command)
-        record_render_subcommand(
-            process_args,
-            args.still_frames,
-            args.template,
-            args.screen_geometry,
-            input_fileno,
-            output_fileno,
-            output_path,
-            args.min_frame_duration,
-            args.max_frame_duration,
-            args.loop_delay,
+    try:
+        # Parse command line arguments
+        subcommand, parsed_args = parse(
+            args=args,
+            templates=svgterm.config.default_templates(),
+            default_template='powershell',
+            default_geometry=None,
+            default_min_dur=1,
+            default_max_dur=None,
+            default_cmd=os.environ.get('SHELL', 'sh'),
+            default_loop_delay=1000
         )
 
-    for handler in logger.handlers:
-        handler.close()
+        # Set log level based on verbosity
+        if parsed_args.get('verbose'):
+            logger.setLevel(logging.DEBUG)
+        elif parsed_args.get('quiet'):
+            logger.setLevel(logging.ERROR)
+
+        logger.debug('Parsed arguments: %s', parsed_args)
+
+        # Get input and output file descriptors
+        if input_fileno is None:
+            input_fileno = sys.stdin.fileno()
+        if output_fileno is None:
+            output_fileno = sys.stdout.fileno()
+
+        # Get the template as bytes
+        template_name = parsed_args.get('template', 'powershell')
+        templates = svgterm.config.default_templates()
+        template = templates[template_name]
+        if isinstance(template, str):
+            template = template.encode('utf-8')
+
+        # Execute the appropriate subcommand
+        if subcommand == 'record':
+            output_path = parsed_args.get('output_path')
+            if output_path is None:
+                _, output_path = tempfile.mkstemp(prefix="svgterm_", suffix=".cast")
+                
+            record_subcommand(
+                process_args=shlex.split(parsed_args.get('command', os.environ.get('SHELL', 'sh'))),
+                geometry=parsed_args.get('screen_geometry'),
+                input_fileno=input_fileno,
+                output_fileno=output_fileno,
+                cast_filename=output_path
+            )
+        elif subcommand == 'render':
+            input_file = parsed_args.get('input_file')
+            if not input_file:
+                raise ValueError("Input file is required for render command")
+                
+            output_path = parsed_args.get('output_path')
+            if parsed_args.get('still_frames', False):
+                if output_path:
+                    os.makedirs(output_path, exist_ok=True)
+                else:
+                    output_path = tempfile.mkdtemp(prefix="svgterm_frames_")
+            elif not output_path:
+                output_path = os.path.splitext(input_file)[0] + '.svg'
+            
+            render_subcommand(
+                still=parsed_args.get('still_frames', False),
+                template=template,
+                cast_filename=input_file,
+                output_path=output_path,
+                min_frame_duration=parsed_args.get('min_frame_duration', 1),
+                max_frame_duration=parsed_args.get('max_frame_duration'),
+                loop_delay=parsed_args.get('loop_delay', 1000)
+            )
+        else:  # Default command (record and render)
+            output_path = parsed_args.get('output_path', 'terminal.svg')
+            
+            record_render_subcommand(
+                process_args=shlex.split(parsed_args.get('command', os.environ.get('SHELL', 'sh'))),
+                still=parsed_args.get('still_frames', False),
+                template=template,
+                geometry=parsed_args.get('screen_geometry'),
+                input_fileno=input_fileno,
+                output_fileno=output_fileno,
+                output_path=output_path,
+                min_frame_duration=parsed_args.get('min_frame_duration', 1),
+                max_frame_duration=parsed_args.get('max_frame_duration'),
+                loop_delay=parsed_args.get('loop_delay', 1000)
+            )
+
+    except KeyboardInterrupt:
+        logger.info('Operation cancelled by user')
+        sys.exit(1)
+    except Exception as e:
+        logger.error('Error: %s', str(e))
+        if 'parsed_args' in locals() and parsed_args.get('verbose'):
+            logger.exception('Stack trace:')
+        sys.exit(1)
+    finally:
+        # Ensure all log handlers are properly closed
+        for handler in logging.root.handlers[:]:
+            handler.close()
+            logging.root.removeHandler(handler)
