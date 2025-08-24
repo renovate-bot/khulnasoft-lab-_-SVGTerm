@@ -40,7 +40,7 @@ setup(
     scripts=["scripts/svgterm"],
     include_package_data=True,
     install_requires=[
-        "lxml>=4.6.0,<6.0.0",
+        "lxml>=6.0.1,<6.1.0",
         "pyte>=0.8.0,<1.0.0",
         "wcwidth>=0.2.0,<0.3.0",
         "typing-extensions>=4.0.0,<5.0.0;python_version<'3.8'",
